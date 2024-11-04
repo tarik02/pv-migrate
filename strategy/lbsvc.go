@@ -39,15 +39,15 @@ func (r *LbSvc) Run(ctx context.Context, attempt *migration.Attempt, logger *slo
 	doneCh := registerCleanupHook(attempt, releaseNames, logger)
 	defer cleanupAndReleaseHook(ctx, attempt, releaseNames, doneCh, logger)
 
-	err = installOnSource(attempt, srcReleaseName, publicKey, srcMountPath, logger)
+	err = installOnDest(attempt, destReleaseName, publicKey, destMountPath, logger)
 	if err != nil {
 		return fmt.Errorf("failed to install on source: %w", err)
 	}
 
-	sourceKubeClient := attempt.Migration.SourceInfo.ClusterClient.KubeClient
-	svcName := srcReleaseName + "-sshd"
+	destKubeClient := attempt.Migration.DestInfo.ClusterClient.KubeClient
+	svcName := destReleaseName + "-sshd"
 
-	lbSvcAddress, err := k8s.GetServiceAddress(ctx, sourceKubeClient, sourceNs, svcName, mig.Request.LBSvcTimeout)
+	lbSvcAddress, err := k8s.GetServiceAddress(ctx, destKubeClient, destNs, svcName, mig.Request.LBSvcTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to get service address: %w", err)
 	}
@@ -57,29 +57,29 @@ func (r *LbSvc) Run(ctx context.Context, attempt *migration.Attempt, logger *slo
 		sshTargetHost = mig.Request.DestHostOverride
 	}
 
-	err = installOnDest(attempt, destReleaseName, privateKey, privateKeyMountPath,
+	err = installOnSource(attempt, srcReleaseName, privateKey, privateKeyMountPath,
 		sshTargetHost, srcMountPath, destMountPath, logger)
 	if err != nil {
 		return fmt.Errorf("failed to install on dest: %w", err)
 	}
 
 	showProgressBar := !attempt.Migration.Request.NoProgressBar
-	kubeClient := destInfo.ClusterClient.KubeClient
-	jobName := destReleaseName + "-rsync"
+	kubeClient := sourceInfo.ClusterClient.KubeClient
+	jobName := srcReleaseName + "-rsync"
 
-	if err = k8s.WaitForJobCompletion(ctx, kubeClient, destNs, jobName, showProgressBar, logger); err != nil {
+	if err = k8s.WaitForJobCompletion(ctx, kubeClient, sourceNs, jobName, showProgressBar, logger); err != nil {
 		return fmt.Errorf("failed to wait for job completion: %w", err)
 	}
 
 	return nil
 }
 
-func installOnSource(attempt *migration.Attempt, releaseName,
-	publicKey, srcMountPath string, logger *slog.Logger,
+func installOnDest(attempt *migration.Attempt, releaseName,
+	publicKey, destMountPath string, logger *slog.Logger,
 ) error {
 	mig := attempt.Migration
-	sourceInfo := mig.SourceInfo
-	namespace := sourceInfo.Claim.Namespace
+	destInfo := mig.DestInfo
+	namespace := destInfo.Claim.Namespace
 
 	vals := map[string]any{
 		"sshd": map[string]any{
@@ -91,35 +91,34 @@ func installOnSource(attempt *migration.Attempt, releaseName,
 			},
 			"pvcMounts": []map[string]any{
 				{
-					"name":      sourceInfo.Claim.Name,
-					"readOnly":  mig.Request.SourceMountReadOnly,
-					"mountPath": srcMountPath,
+					"name":      destInfo.Claim.Name,
+					"mountPath": destMountPath,
 				},
 			},
-			"affinity": sourceInfo.AffinityHelmValues,
+			"affinity": destInfo.AffinityHelmValues,
 		},
 	}
 
-	return installHelmChart(attempt, sourceInfo, releaseName, vals, logger)
+	return installHelmChart(attempt, destInfo, releaseName, vals, logger)
 }
 
-func installOnDest(attempt *migration.Attempt, releaseName, privateKey,
+func installOnSource(attempt *migration.Attempt, releaseName, privateKey,
 	privateKeyMountPath, sshHost, srcMountPath, destMountPath string, logger *slog.Logger,
 ) error {
 	mig := attempt.Migration
-	destInfo := mig.DestInfo
-	namespace := destInfo.Claim.Namespace
+	srcInfo := mig.SourceInfo
+	namespace := srcInfo.Claim.Namespace
 
 	srcPath := srcMountPath + "/" + mig.Request.Source.Path
 	destPath := destMountPath + "/" + mig.Request.Dest.Path
 	rsyncCmd := rsync.Cmd{
-		NoChown:    mig.Request.NoChown,
-		Delete:     mig.Request.DeleteExtraneousFiles,
-		SrcPath:    srcPath,
-		DestPath:   destPath,
-		SrcUseSSH:  true,
-		SrcSSHHost: sshHost,
-		Compress:   mig.Request.Compress,
+		NoChown:     mig.Request.NoChown,
+		Delete:      mig.Request.DeleteExtraneousFiles,
+		SrcPath:     srcPath,
+		DestPath:    destPath,
+		DestUseSSH:  true,
+		DestSSHHost: sshHost,
+		Compress:    mig.Request.Compress,
 	}
 
 	rsyncCmdStr, err := rsyncCmd.Build()
@@ -137,16 +136,17 @@ func installOnDest(attempt *migration.Attempt, releaseName, privateKey,
 			"sshRemoteHost":       sshHost,
 			"pvcMounts": []map[string]any{
 				{
-					"name":      destInfo.Claim.Name,
-					"mountPath": destMountPath,
+					"name":      srcInfo.Claim.Name,
+					"readOnly":  mig.Request.SourceMountReadOnly,
+					"mountPath": srcMountPath,
 				},
 			},
 			"command":  rsyncCmdStr,
-			"affinity": destInfo.AffinityHelmValues,
+			"affinity": srcInfo.AffinityHelmValues,
 		},
 	}
 
-	return installHelmChart(attempt, destInfo, releaseName, vals, logger)
+	return installHelmChart(attempt, srcInfo, releaseName, vals, logger)
 }
 
 func formatSSHTargetHost(host string) string {
